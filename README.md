@@ -2,10 +2,10 @@
 
 ## 目的と設計
 
-- 正本は構造化データ（JSONL）であり、平文の台帳・MEMORY は閲覧用の生成物という位置づけにする。
-- 対象は2層に分ける。
-  - プラットフォーム層（`data/platform.jsonl`）： Muse に組み込まれた仕組み。`scan` が実物（docs、スキル、コネクタ、Goal、cron、中核ファイル、ドメイン／エンティティファイル）を列挙して再生成する。手で編集しない。
-  - 構築層（`data/registry.jsonl`）： あなたの環境で上に積んだ技術・経路・手順・失敗パターン。`add` で1件ずつ登録する側。
+- 正本は SQLite データベース（`data/muse-inv.db`）であり、平文の台帳・MEMORY は閲覧用の生成物という位置づけにする。JSONL は正本ではない（2026-11-15 に JSONL 正本から移行。経緯は下記「SQLite 移行」節）。JSONL の用途は `export` の出力形式と、移行元スナップショット（`data/registry-export-2026-11-15.jsonl`、`data/platform-export-2026-11-15.jsonl`、正本ではない）に限る。
+- 対象は2層に分け、1つの `items` テーブルに `layer` 列で区別して持つ。
+  - プラットフォーム層（`layer='platform'`）： Muse に組み込まれた仕組み。`scan` が実物（docs、スキル、コネクタ、Goal、cron、中核ファイル、ドメイン／エンティティファイル）を列挙して再生成する。手で編集しない。
+  - 構築層（`layer='built'`）： あなたの環境で上に積んだ技術・経路・手順・失敗パターン。`add` で1件ずつ登録する側。
 - 見落とし防止は注意ではなく機械で行う： `scan` の実物列挙と差分、`audit` の母集団に対する件数照合、スキーマ検証（不正な行は黙って飛ばさずエラーにする）。
 - 積み下ろしは `export` / `import-check` で行う。`export` は移送可否（portability）で絞り、依存（depends_on）の閉包と manifest を付ける。受け側は `import-check` で「既にある／不足／競合」を照合してから取り込む。
 
@@ -13,7 +13,7 @@
 
 ```sh
 cd ~/workspace/muse-inv
-./muse-inv scan          # プラットフォーム層を再生成し、前回との差分を表示
+./muse-inv scan          # プラットフォーム層を DB へ再生成し、前回との差分を表示
 ./muse-inv list          # 構築層の一覧（--layer platform|all、--kind、--status で絞れる）
 ./muse-inv show inv-098  # 1件を JSON で表示
 ./muse-inv search "Xポストの全文を読む経路" --top 5
@@ -23,29 +23,45 @@ cd ~/workspace/muse-inv
 ./muse-inv verify        # 固定テスト8問の検索順位を検証
 ./muse-inv export        # exports/<日時>/ に manifest.json / items.jsonl / manifest.md
 ./muse-inv import-check exports/<日時>/
-./muse-inv migrate       # 知識台帳 markdown から registry.jsonl を再生成（ワンオフ）
+./muse-inv migrate       # 知識台帳 markdown から構築層を DB へ再生成（ワンオフ）
+./muse-inv import-jsonl  # 旧 JSONL 正本から SQLite DB へ取り込む（移行用、通常は使わない）
 ```
 
 Python 3 標準ライブラリのみで動作する（pip 依存なし）。
 
-## スキーマ（1行1レコード、全項目必須）
+## スキーマ（SQLite、`data/muse-inv.db`）
 
-| 項目 | 内容 |
+テーブルは3つ。`items`（本体）、`item_dependencies`（依存関係）、`meta`（schema_version 等）。
+
+`items` の列（全レコード共通の形は移行前と同一で、`show`／`export` の JSON 形式も不変）：
+
+| 列 | 内容 |
 |---|---|
-| id | 安定した一意の slug。構築層は `inv-001` 形式、プラットフォーム層は `platform:<種別>:<名前>` |
-| name | 名前 |
+| id | 安定した一意の slug（主キー）。構築層は `inv-001` 形式、プラットフォーム層は `platform:<種別>:<名前>` |
+| name | 名前（NOT NULL、空文字不可） |
 | kind | 構築層： tool / route / procedure / failure-pattern / automation / setting。プラットフォーム層： skill / connector / doc / goal / cron / core-file / domain-file |
 | layer | built / platform |
 | status | active / superseded / unadopted / unknown / prepared |
-| source | 出典（ファイルパス、行番号を含むことがある） |
+| source | 出典（ファイルパス、行番号を含むことがある。NOT NULL、空文字不可） |
 | description | 1行の説明 |
-| alias | 日本語の用途・別名。空にできるのはプラットフォーム層のみ |
+| alias | 日本語の用途・別名。空にできるのはプラットフォーム層のみ（構築層は CHECK で空文字を拒否） |
 | portability | portable / conditional / env-specific / do-not-port / unclassified |
-| depends_on | 依存先 id のリスト（空可） |
-| curated_in | 整理済みの置き場所。`daily-log only` を含むものは日次ログにしかない |
-| last_verified | ISO 日付、または空 |
+| curated_in | 整理済みの置き場所。`daily-log only` を含むものは日次ログにしかない。空は NULL |
+| last_verified | ISO 日付（形式を CHECK で検証）、または NULL |
 
-追加フィールドとして、移行したレコードには `inv_no`（台帳の番号）、`section`（台帳の節）、必要に応じて `status_note`（台帳の元の状態表記）が入る。
+値域と層×種別の対応は DB の CHECK 制約が強制する。CLI の検証は読みやすいエラー表示のためであり、制約の実体は DB 側にある。直接 SQL で書いても、不正な status／portability、層に合わない kind、構築層の空 alias、形式不正な last_verified、重複 id はいずれも拒否される（2026-11-15 実測）。
+
+層固有の列：構築層は `inv_no`（台帳の番号、一意）、`section`（台帳の節）、`status_note`（台帳の元の状態表記、必要時のみ）。プラットフォーム層は `category`（doc／system-skill／custom-skill／system-connector／custom-connector／goal／cron／core-file／domain-file／entity-file）。プラットフォーム層の行に `inv_no` 等が入ることは CHECK で禁止している。
+
+`depends_on` は列ではなく `item_dependencies` テーブル（item_id、depends_on_id、ordinal）で持つ。両端とも `items(id)` への外部キーで、存在しない id への依存は DB が拒否する。`add` でも依存先の存在を事前に確認する。
+
+## SQLite 移行（2026-11-15、本人の指示）
+
+- 経緯：初回構築では「DB／JSONL＋型付きアクセス層」を同等として JSONL を正本にしたが、その後本人が「JSONL は平文ファイルの一種でしかなく、データベースではない。構造化された現在の状態は実 DB に置くべきだ」と訂正した（carrier-registry は同日に SQLite へ移行済み）。muse-inv にも同じ訂正を適用し、正本を SQLite に移した。テーブル設計は移行前に実データ全476件の項目構成を確認して確定した。
+- 移行：新設コマンド `import-jsonl` で旧 `registry.jsonl`（164件）＋`platform.jsonl`（312件）を `data/muse-inv.db` へ取り込み。移行直後の照合で、id 集合・内容（canonical JSON 比較）・並び順のいずれも JSONL 側と差分0を確認した。
+- 検証（移行後に全コマンドを実測）：list 164／312件、audit の集計と出典確認（204件・切れ0）は移行前と同一、verify 8/8 PASS（順位も同一）、export 164件→import-check で一致164／不足0／競合0。add は正常登録（依存付き）・重複 id・存在しない依存先のいずれも期待どおり動作し、テスト行は削除して164件に復帰（依存行も CASCADE で消去）。DB への直接 INSERT でも制約違反8種すべてが拒否され、`integrity_check` は ok。
+- `scan` は DB 上で動作し、移行後の初回実行で当日の環境変化（cron +7、custom-skill +1、MEMORY.md 変更）を差分として検出、2回目は差分0で安定。プラットフォーム層は現在320件（合計484件）。
+- 旧 JSONL 2ファイルは `data/registry-export-2026-11-15.jsonl`、`data/platform-export-2026-11-15.jsonl` へ改名し、移行時のスナップショット（正本ではない）として残置。改名後も CLI は JSONL なしで動作することを確認済み。
 
 ## 実測値（2026-11-15、初回構築時）
 

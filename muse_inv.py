@@ -2,24 +2,28 @@
 """muse-inv — Muse の仕組み・技術・環境の蓄積管理 CLI.
 
 正本:
-  data/registry.jsonl  構築層 (built) — 手で登録する側。1行1レコード。
-  data/platform.jsonl  プラットフォーム層 (platform) — scan が実物から生成する。手で編集しない。
+  data/muse-inv.db  SQLite データベース (items / item_dependencies / meta)。
+  構築層 (built) とプラットフォーム層 (platform) を1つの items テーブルで持ち、
+  layer 列で分ける。値域・必須・層と種別の対応は DB の CHECK 制約が強制する。
+  JSONL は正本ではない。export の出力形式と、移行元スナップショット
+  (data/*-export-2026-11-15.jsonl) としてのみ使う。
 
 Python 3 標準ライブラリのみで動作する。
 """
 import argparse
 import datetime
-import hashlib
 import json
 import re
+import sqlite3
 import sys
 from collections import Counter
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 DATA = BASE / "data"
-REGISTRY = DATA / "registry.jsonl"
-PLATFORM = DATA / "platform.jsonl"
+DB_PATH = DATA / "muse-inv.db"
+REGISTRY_JSONL = DATA / "registry-export-2026-11-15.jsonl"
+PLATFORM_JSONL = DATA / "platform-export-2026-11-15.jsonl"
 EXPORTS = BASE / "exports"
 HOME = Path.home()
 
@@ -30,10 +34,167 @@ PORTABILITIES = {"portable", "conditional", "env-specific", "do-not-port", "uncl
 REQUIRED = ["id", "name", "kind", "layer", "status", "source", "description",
             "alias", "portability", "depends_on", "curated_in", "last_verified"]
 
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS items (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL CHECK (length(name) > 0),
+    kind          TEXT NOT NULL,
+    layer         TEXT NOT NULL CHECK (layer IN ('built', 'platform')),
+    status        TEXT NOT NULL CHECK (status IN
+                      ('active', 'superseded', 'unadopted', 'unknown', 'prepared')),
+    source        TEXT NOT NULL CHECK (length(source) > 0),
+    description   TEXT NOT NULL,
+    alias         TEXT NOT NULL DEFAULT '',
+    portability   TEXT NOT NULL CHECK (portability IN
+                      ('portable', 'conditional', 'env-specific', 'do-not-port',
+                       'unclassified')),
+    curated_in    TEXT,
+    last_verified TEXT CHECK (last_verified IS NULL OR last_verified GLOB
+                      '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+    inv_no        INTEGER UNIQUE,
+    section       TEXT,
+    status_note   TEXT,
+    category      TEXT,
+    CHECK (
+        (layer = 'built'
+         AND kind IN ('tool', 'route', 'procedure', 'failure-pattern',
+                      'automation', 'setting')
+         AND category IS NULL)
+        OR
+        (layer = 'platform'
+         AND kind IN ('skill', 'connector', 'doc', 'goal', 'cron',
+                      'core-file', 'domain-file')
+         AND category IS NOT NULL
+         AND inv_no IS NULL AND section IS NULL AND status_note IS NULL)
+    ),
+    CHECK (layer = 'platform' OR length(alias) > 0)
+);
+CREATE TABLE IF NOT EXISTS item_dependencies (
+    item_id       TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    depends_on_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    ordinal       INTEGER NOT NULL,
+    PRIMARY KEY (item_id, depends_on_id)
+);
+CREATE INDEX IF NOT EXISTS idx_items_layer ON items(layer);
+CREATE INDEX IF NOT EXISTS idx_items_kind ON items(kind);
+CREATE INDEX IF NOT EXISTS idx_items_status ON items(status);
+CREATE INDEX IF NOT EXISTS idx_items_name ON items(name);
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+
+# ---------------------------------------------------------------- DB layer
+def connect(create=False):
+    """Open the registry DB. With create=True, create file + schema if absent."""
+    if not DB_PATH.exists() and not create:
+        print(f"ERROR: registry DB not found: {DB_PATH}\n"
+              "  先に `muse-inv import-jsonl` (移行) か `muse-inv scan` / "
+              "`muse-inv migrate` を実行してください。", file=sys.stderr)
+        sys.exit(2)
+    DATA.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    if create:
+        conn.executescript(SCHEMA)
+        conn.execute("INSERT OR IGNORE INTO meta(key, value) "
+                     "VALUES ('schema_version', '1')")
+        conn.commit()
+    return conn
+
+
+def row_to_record(conn, row):
+    deps = [r[0] for r in conn.execute(
+        "SELECT depends_on_id FROM item_dependencies WHERE item_id = ? "
+        "ORDER BY ordinal", (row["id"],))]
+    rec = {
+        "id": row["id"], "name": row["name"], "kind": row["kind"],
+        "layer": row["layer"], "status": row["status"], "source": row["source"],
+        "description": row["description"], "alias": row["alias"],
+        "portability": row["portability"], "depends_on": deps,
+        "curated_in": row["curated_in"] or "",
+        "last_verified": row["last_verified"] or "",
+    }
+    for opt in ("inv_no", "section", "status_note", "category"):
+        if row[opt] is not None:
+            rec[opt] = row[opt]
+    return rec
+
+
+def fetch_layer(conn, layer):
+    rows = conn.execute(
+        "SELECT * FROM items WHERE layer = ? ORDER BY rowid", (layer,)).fetchall()
+    return [row_to_record(conn, r) for r in rows]
+
+
+def fetch_all(conn):
+    return fetch_layer(conn, "built"), fetch_layer(conn, "platform")
+
+
+def insert_record(conn, rec):
+    """Insert one validated record + its dependencies (caller commits)."""
+    conn.execute(
+        "INSERT INTO items (id, name, kind, layer, status, source, description,"
+        " alias, portability, curated_in, last_verified, inv_no, section,"
+        " status_note, category) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (rec["id"], rec["name"], rec["kind"], rec["layer"], rec["status"],
+         rec["source"], rec["description"], rec["alias"], rec["portability"],
+         rec["curated_in"] or None, rec["last_verified"] or None,
+         rec.get("inv_no"), rec.get("section"), rec.get("status_note"),
+         rec.get("category")))
+    for i, dep in enumerate(rec["depends_on"]):
+        conn.execute(
+            "INSERT INTO item_dependencies (item_id, depends_on_id, ordinal) "
+            "VALUES (?,?,?)", (rec["id"], dep, i))
+
+
+def upsert_record(conn, rec):
+    """Insert or update one record in place (incoming dependency rows of other
+    items are preserved; the record's own outgoing rows are replaced)."""
+    conn.execute(
+        "INSERT INTO items (id, name, kind, layer, status, source, description,"
+        " alias, portability, curated_in, last_verified, inv_no, section,"
+        " status_note, category) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(id) DO UPDATE SET name=excluded.name, kind=excluded.kind,"
+        " layer=excluded.layer, status=excluded.status, source=excluded.source,"
+        " description=excluded.description, alias=excluded.alias,"
+        " portability=excluded.portability, curated_in=excluded.curated_in,"
+        " last_verified=excluded.last_verified, inv_no=excluded.inv_no,"
+        " section=excluded.section, status_note=excluded.status_note,"
+        " category=excluded.category",
+        (rec["id"], rec["name"], rec["kind"], rec["layer"], rec["status"],
+         rec["source"], rec["description"], rec["alias"], rec["portability"],
+         rec["curated_in"] or None, rec["last_verified"] or None,
+         rec.get("inv_no"), rec.get("section"), rec.get("status_note"),
+         rec.get("category")))
+    conn.execute("DELETE FROM item_dependencies WHERE item_id = ?", (rec["id"],))
+    for i, dep in enumerate(rec["depends_on"]):
+        conn.execute(
+            "INSERT INTO item_dependencies (item_id, depends_on_id, ordinal) "
+            "VALUES (?,?,?)", (rec["id"], dep, i))
+
+
+def replace_layer(conn, layer, records):
+    """Replace one layer's contents with `records` inside a transaction:
+    upsert the new set, delete ids that disappeared (their outgoing
+    dependency rows cascade)."""
+    with conn:
+        old_ids = {r[0] for r in conn.execute(
+            "SELECT id FROM items WHERE layer = ?", (layer,))}
+        new_ids = {r["id"] for r in records}
+        for rid in sorted(old_ids - new_ids):
+            conn.execute("DELETE FROM items WHERE id = ?", (rid,))
+        for rec in records:
+            upsert_record(conn, rec)
+
 
 # ---------------------------------------------------------------- validation
 def validate_record(rec, where="record"):
-    """Return list of error strings (empty = valid)."""
+    """Return list of error strings (empty = valid). Application-level check
+    with readable messages; the DB CHECK constraints are the backstop."""
     errs = []
     if not isinstance(rec, dict):
         return [f"{where}: not a JSON object"]
@@ -82,7 +243,8 @@ def validate_record(rec, where="record"):
 
 
 def load_jsonl(path, label):
-    """Load + validate a jsonl file. Invalid lines are reported, never skipped silently."""
+    """Load + validate a jsonl file (import-jsonl / import-check 用).
+    Invalid lines are reported, never skipped silently."""
     records, errors = [], []
     if not path.exists():
         return records, [f"{label}: file not found: {path}"]
@@ -212,14 +374,8 @@ def scan_sources():
 
 
 def cmd_scan(args):
-    old_records, old_errors = ([], [])
-    if PLATFORM.exists():
-        old_records, old_errors = load_jsonl(PLATFORM, "platform.jsonl(previous)")
-        if old_errors:
-            print("WARNING: previous platform.jsonl had errors (kept for diff only):",
-                  file=sys.stderr)
-            for e in old_errors:
-                print(f"  {e}", file=sys.stderr)
+    conn = connect(create=True)
+    old_records = fetch_layer(conn, "platform")
     records, counts, missing = scan_sources()
     errs = []
     for r in records:
@@ -230,10 +386,12 @@ def cmd_scan(args):
     if dupes:
         print(f"ERROR: scan produced duplicate ids: {dupes}", file=sys.stderr)
         sys.exit(2)
-    DATA.mkdir(parents=True, exist_ok=True)
-    with PLATFORM.open("w", encoding="utf-8") as fh:
-        for r in records:
-            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    registry = fetch_layer(conn, "built")
+    collisions = sorted({r["id"] for r in records} & {r["id"] for r in registry})
+    if collisions:
+        print(f"ERROR: scan ids collide with built layer: {collisions}", file=sys.stderr)
+        sys.exit(2)
+    replace_layer(conn, "platform", records)
     # diff vs previous
     old_by_id = {r["id"]: r for r in old_records}
     new_by_id = {r["id"]: r for r in records}
@@ -241,10 +399,7 @@ def cmd_scan(args):
     removed = sorted(set(old_by_id) - set(new_by_id))
     changed = sorted(i for i in set(old_by_id) & set(new_by_id)
                      if canonical(old_by_id[i]) != canonical(new_by_id[i]))
-    # diff vs registry (id collisions + counts)
-    registry, reg_errors = load_jsonl(REGISTRY, "registry.jsonl")
-    collisions = sorted(set(new_by_id) & {r["id"] for r in registry})
-    print(f"scan: wrote {len(records)} platform records -> {PLATFORM}")
+    print(f"scan: wrote {len(records)} platform records -> {DB_PATH}")
     print("counts by category:")
     for cat in sorted(counts):
         print(f"  {cat}: {counts[cat]}")
@@ -253,18 +408,15 @@ def cmd_scan(args):
         print("missing sources (reported, not fatal):")
         for m in missing:
             print(f"  - {m}")
-    print(f"diff vs previous platform.jsonl: added={len(added)} removed={len(removed)} changed={len(changed)}")
+    print(f"diff vs previous platform layer: added={len(added)} removed={len(removed)} changed={len(changed)}")
     for i in added:
         print(f"  + {i}")
     for i in removed:
         print(f"  - {i}")
     for i in changed:
         print(f"  ~ {i}")
-    print(f"registry: {len(registry)} built records loaded"
-          + (f", {len(reg_errors)} error(s)" if reg_errors else "")
-          + f"; id collisions platform∩registry: {len(collisions)}")
-    for c in collisions:
-        print(f"  collision: {c}")
+    print(f"registry: {len(registry)} built records; "
+          f"id collisions platform∩registry: {len(collisions)}")
     return 0
 
 
@@ -343,11 +495,9 @@ def cmd_migrate(args):
     if nums != sorted(nums) or len(set(nums)) != len(nums):
         print("ERROR: inventory numbers are not a clean sequence", file=sys.stderr)
         return 2
-    DATA.mkdir(parents=True, exist_ok=True)
-    with REGISTRY.open("w", encoding="utf-8") as fh:
-        for r in records:
-            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-    print(f"migrate: parsed {len(records)} records -> {REGISTRY}")
+    conn = connect(create=True)
+    replace_layer(conn, "built", records)
+    print(f"migrate: parsed {len(records)} records -> {DB_PATH} (built layer)")
     print("by section: " + ", ".join(f"{s}:{per_section[s]}" for s in sorted(per_section)))
     print(f"number range: {min(nums)}..{max(nums)}, gaps: "
           f"{[n for n in range(min(nums), max(nums) + 1) if n not in set(nums)]}")
@@ -359,12 +509,48 @@ def cmd_migrate(args):
     return 0
 
 
+# ---------------------------------------------------------------- import-jsonl
+def cmd_import_jsonl(args):
+    """One-off storage migration: load the former JSONL source of truth into
+    the SQLite DB. Refuses to overwrite an existing DB unless --force
+    (the old DB is kept as muse-inv.db.bak-<timestamp>)."""
+    registry, e1 = load_jsonl(Path(args.registry), "registry.jsonl")
+    platform, e2 = load_jsonl(Path(args.platform), "platform.jsonl")
+    die_on_errors(e1 + e2)
+    overlap = sorted({r["id"] for r in registry} & {r["id"] for r in platform})
+    if overlap:
+        print(f"ERROR: id overlap between layers: {overlap}", file=sys.stderr)
+        return 2
+    if DB_PATH.exists():
+        if not args.force:
+            print(f"ERROR: DB already exists: {DB_PATH} "
+                  "(再取り込みには --force。既存 DB は .bak として残ります)",
+                  file=sys.stderr)
+            return 2
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        bak = DB_PATH.with_name(f"muse-inv.db.bak-{stamp}")
+        DB_PATH.rename(bak)
+        print(f"import-jsonl: existing DB moved to {bak}")
+    conn = connect(create=True)
+    with conn:
+        for rec in registry + platform:
+            insert_record(conn, rec)
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) "
+                     "VALUES ('imported_from', 'registry.jsonl + platform.jsonl')")
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('imported_at', ?)",
+                     (datetime.datetime.now().isoformat(timespec="seconds"),))
+    print(f"import-jsonl: {len(registry)} built + {len(platform)} platform "
+          f"= {len(registry) + len(platform)} records -> {DB_PATH}")
+    return 0
+
+
 # ---------------------------------------------------------------- list/show
 def load_all():
-    registry, e1 = load_jsonl(REGISTRY, "registry.jsonl")
-    platform, e2 = load_jsonl(PLATFORM, "platform.jsonl")
-    die_on_errors(e1 + e2)
-    return registry, platform
+    conn = connect()
+    try:
+        return fetch_all(conn)
+    finally:
+        conn.close()
 
 
 def cmd_list(args):
@@ -423,8 +609,6 @@ def keyword_score(q_lat, q_big, rec):
     for tok in q_lat:
         if len(tok) >= 3 and tok in n_lat:
             score += 0.25
-    # exact substring hits on name/alias (latin or Japanese) — strong signal
-    q_low = rec.get("_q", "")
     return min(score, 1.2)
 
 
@@ -469,16 +653,26 @@ def cmd_add(args):
         for e in errs:
             print(f"ERROR: {e}", file=sys.stderr)
         return 2
-    registry, e1 = load_jsonl(REGISTRY, "registry.jsonl")
-    die_on_errors(e1)
-    if any(r["id"] == args.id for r in registry):
-        print(f"ERROR: id already exists: {args.id}", file=sys.stderr)
-        return 2
-    DATA.mkdir(parents=True, exist_ok=True)
-    with REGISTRY.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    conn = connect()
+    try:
+        exists = conn.execute("SELECT 1 FROM items WHERE id = ?",
+                              (args.id,)).fetchone()
+        if exists:
+            print(f"ERROR: id already exists: {args.id}", file=sys.stderr)
+            return 2
+        missing_deps = [d for d in rec["depends_on"]
+                        if not conn.execute("SELECT 1 FROM items WHERE id = ?",
+                                            (d,)).fetchone()]
+        if missing_deps:
+            print(f"ERROR: depends_on targets not in registry: {missing_deps}",
+                  file=sys.stderr)
+            return 2
+        with conn:
+            insert_record(conn, rec)
+    finally:
+        conn.close()
     print(json.dumps(rec, ensure_ascii=False, indent=2))
-    print(f"add: appended {args.id} to {REGISTRY}")
+    print(f"add: inserted {args.id} into {DB_PATH}")
     return 0
 
 
@@ -673,8 +867,13 @@ def main():
                                  description="Muse の仕組み・技術・環境の蓄積管理 CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("scan", help="実物を列挙して platform.jsonl を再生成し、差分を表示する")
-    sub.add_parser("migrate", help="知識台帳 markdown を registry.jsonl へ移行する（ワンオフ）")
+    sub.add_parser("scan", help="実物を列挙して platform 層を DB へ再生成し、差分を表示する")
+    sub.add_parser("migrate", help="知識台帳 markdown を built 層へ移行する（ワンオフ）")
+    p = sub.add_parser("import-jsonl", help="旧 JSONL 正本から SQLite DB へ取り込む（移行用）")
+    p.add_argument("--registry", default=str(REGISTRY_JSONL))
+    p.add_argument("--platform", default=str(PLATFORM_JSONL))
+    p.add_argument("--force", action="store_true",
+                   help="既存 DB を .bak へ退避してから取り込み直す")
     p = sub.add_parser("list", help="レコード一覧")
     p.add_argument("--layer", choices=["built", "platform", "all"], default="built")
     p.add_argument("--kind")
@@ -706,10 +905,10 @@ def main():
     p.add_argument("path")
 
     args = ap.parse_args()
-    fn = {"scan": cmd_scan, "migrate": cmd_migrate, "list": cmd_list,
-          "show": cmd_show, "search": cmd_search, "add": cmd_add,
-          "audit": cmd_audit, "verify": cmd_verify, "export": cmd_export,
-          "import-check": cmd_import_check}[args.cmd]
+    fn = {"scan": cmd_scan, "migrate": cmd_migrate, "import-jsonl": cmd_import_jsonl,
+          "list": cmd_list, "show": cmd_show, "search": cmd_search,
+          "add": cmd_add, "audit": cmd_audit, "verify": cmd_verify,
+          "export": cmd_export, "import-check": cmd_import_check}[args.cmd]
     return fn(args)
 
 
