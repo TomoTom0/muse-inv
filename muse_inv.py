@@ -280,6 +280,15 @@ def canonical(rec):
     return json.dumps(rec, ensure_ascii=False, sort_keys=True)
 
 
+def canonical_diff(rec):
+    """Canonical form for the scan diff. scan regenerates last_verified as
+    today's date on every run, so including it would report every platform
+    record as changed on the first scan of a new day even when nothing in
+    the environment changed; exclude it (canonical() keeps it)."""
+    return json.dumps({k: v for k, v in rec.items() if k != "last_verified"},
+                      ensure_ascii=False, sort_keys=True)
+
+
 def today():
     return datetime.date.today().isoformat()
 
@@ -398,7 +407,7 @@ def cmd_scan(args):
     added = sorted(set(new_by_id) - set(old_by_id))
     removed = sorted(set(old_by_id) - set(new_by_id))
     changed = sorted(i for i in set(old_by_id) & set(new_by_id)
-                     if canonical(old_by_id[i]) != canonical(new_by_id[i]))
+                     if canonical_diff(old_by_id[i]) != canonical_diff(new_by_id[i]))
     print(f"scan: wrote {len(records)} platform records -> {DB_PATH}")
     print("counts by category:")
     for cat in sorted(counts):

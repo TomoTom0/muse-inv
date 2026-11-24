@@ -102,6 +102,12 @@ Python 3 標準ライブラリのみで動作する（pip 依存なし）。
 - 既定の `export` で164件を書き出し、`import-check` で照合した結果： 一致164件、不足0件、競合0件。
 - portability が全件 unclassified のため、`--portability portable` のような絞り込みでは現状0件になる。依存閉包も depends_on が空のため実質未行使であり、manifest にその旨を明記している。
 
+## scan 差分と last_verified（2026-11-25 修正）
+
+- 不具合: `scan` の差分（changed）判定が `last_verified` まで含めて比較していた。scan は全レコードの `last_verified` を実行当日の日付で再生成するため、日付が変わった最初の scan では、実環境に変化がなくてもプラットフォーム層の全レコードが changed と報告され、差分による見落とし防止が機能しなかった。
+- 修正: 差分判定専用の `canonical_diff`（`last_verified` を除いた canonical 形）を導入し、`scan` の changed 判定に使う。`import-check` の同一性比較（`canonical`）は従来どおり `last_verified` を含む。回帰テストは `tests/test_scan_diff.py`（`python3 -m unittest discover -s tests`）。
+- 実測（fixture 環境、プラットフォーム9件）: 修正前は `last_verified` の付け替えだけで changed=9。修正後は changed=0、見出し変更では changed=1 と実変更は検出される。
+
 ## 制限
 
 - `search` は標準ライブラリだけのキーワード検索（ラテン語トークン＋日本語バイグラム、名前・別名を重み付け）であり、ベクトル索引（`vector-index/query.py`）は統合していない。固定テスト8問では両者の期待項目が上位に入ることを確認済みの範囲で使う。
