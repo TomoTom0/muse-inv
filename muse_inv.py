@@ -235,10 +235,16 @@ def validate_record(rec, where="record"):
     if not isinstance(lv, str):
         errs.append(f"{where}: last_verified must be a string")
     elif lv != "":
-        try:
-            datetime.date.fromisoformat(lv)
-        except ValueError:
-            errs.append(f"{where}: last_verified {lv!r} is not an ISO date")
+        # The DB CHECK requires the dashed YYYY-MM-DD form. fromisoformat
+        # alone also accepts the basic format (YYYYMMDD), which passes here
+        # but is then rejected at INSERT time; require the dashed form.
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", lv):
+            errs.append(f"{where}: last_verified {lv!r} is not in YYYY-MM-DD form")
+        else:
+            try:
+                datetime.date.fromisoformat(lv)
+            except ValueError:
+                errs.append(f"{where}: last_verified {lv!r} is not an ISO date")
     return errs
 
 
@@ -835,18 +841,11 @@ def cmd_import_check(args):
     if not items_path.exists():
         print(f"ERROR: items file not found: {items_path}", file=sys.stderr)
         return 2
-    incoming, errs = [], []
-    for i, line in enumerate(items_path.read_text(encoding="utf-8").splitlines(), 1):
-        if not line.strip():
-            continue
-        try:
-            incoming.append(json.loads(line))
-        except json.JSONDecodeError as e:
-            errs.append(f"{items_path}:{i}: {e}")
-    if errs:
-        for e in errs:
-            print(f"ERROR: {e}", file=sys.stderr)
-        return 2
+    # Validate on load, exactly like import-jsonl: invalid lines (bad JSON,
+    # schema violations, duplicate ids) are errors, never silently
+    # classified as present / missing / conflict.
+    incoming, errs = load_jsonl(items_path, str(items_path))
+    die_on_errors(errs)
     registry, platform = load_all()
     current = {r["id"]: r for r in registry + platform}
     present, missing, conflict = [], [], []
