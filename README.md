@@ -108,6 +108,14 @@ Python 3 標準ライブラリのみで動作する（pip 依存なし）。
 - 修正: 差分判定専用の `canonical_diff`（`last_verified` を除いた canonical 形）を導入し、`scan` の changed 判定に使う。`import-check` の同一性比較（`canonical`）は従来どおり `last_verified` を含む。回帰テストは `tests/test_scan_diff.py`（`python3 -m unittest discover -s tests`）。
 - 実測（fixture 環境、プラットフォーム9件）: 修正前は `last_verified` の付け替えだけで changed=9。修正後は changed=0、見出し変更では changed=1 と実変更は検出される。
 
+## import-check の入力検証と last_verified の形式（2026-11-25 修正）
+
+- 不具合1: `import-check` が items.jsonl を独自にパースし、スキーマ検証をしていなかった。status が不正なレコードはエラーにならず「不足」に分類され、id の無い行は KeyError のトレースバックで落ち、重複した id 行は二重に数えられた。検証付きローダ `load_jsonl`（`import-jsonl` が使用）があるのに `import-check` だけが使っておらず、設計原則（不正な行は黙って飛ばさずエラーにする）からも外れていた。
+- 修正1: `import-check` も `load_jsonl` で読み込むようにした。不正な行（JSON 不正・スキーマ違反・重複 id）は行番号付きのエラーを出して終了コード2で拒否する。正常入力に対する分類（一致／不足／競合）の挙動は不変で、export → import-check の往復は従来どおり全件一致になることを実測した。
+- 不具合2: `validate_record` の `last_verified` 検証は `fromisoformat` のみで、基本形式（YYYYMMDD）を通してしまった。DB の CHECK はダッシュ付き形式（YYYY-MM-DD）を要求するため、`add --last-verified 20261115` がアプリ検証を通過した後に INSERT で IntegrityError のトレースバックになっていた。
+- 修正2: アプリ側でもダッシュ付き形式を必須にし、そのうえで実在する日付かも検証する。不正な形式は読みやすいエラーで弾く。
+- 回帰テストは `tests/test_import_check.py`（分類1件・不正入力4件・日付形式3件）。全テストは `python3 -m unittest discover -s tests` で11件通過。
+
 ## 制限
 
 - `search` は標準ライブラリだけのキーワード検索（ラテン語トークン＋日本語バイグラム、名前・別名を重み付け）であり、ベクトル索引（`vector-index/query.py`）は統合していない。固定テスト8問では両者の期待項目が上位に入ることを確認済みの範囲で使う。
